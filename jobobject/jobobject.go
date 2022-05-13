@@ -430,7 +430,7 @@ func (job *JobObject) QueryProcessorStats() (*winapi.JOBOBJECT_BASIC_ACCOUNTING_
 }
 
 // QueryStorageStats gets the storage (I/O) stats for the job object.
-func (job *JobObject) QueryStorageStats() (*winapi.JOBOBJECT_BASIC_AND_IO_ACCOUNTING_INFORMATION, error) {
+func (job *JobObject) QueryStorageStats() (*winapi.JOBOBJECT_IO_ATTRIBUTION_INFORMATION, error) {
 	job.handleLock.RLock()
 	defer job.handleLock.RUnlock()
 
@@ -438,10 +438,12 @@ func (job *JobObject) QueryStorageStats() (*winapi.JOBOBJECT_BASIC_AND_IO_ACCOUN
 		return nil, ErrAlreadyClosed
 	}
 
-	info := winapi.JOBOBJECT_BASIC_AND_IO_ACCOUNTING_INFORMATION{}
+	info := winapi.JOBOBJECT_IO_ATTRIBUTION_INFORMATION{
+		ControlFlags: winapi.JOBOBJECT_IO_ATTRIBUTION_CONTROL_ENABLE,
+	}
 	if err := winapi.QueryInformationJobObject(
 		job.handle,
-		winapi.JobObjectBasicAndIoAccountingInformation,
+		winapi.JobObjectIoAttribution,
 		uintptr(unsafe.Pointer(&info)),
 		uint32(unsafe.Sizeof(info)),
 		nil,
@@ -545,4 +547,63 @@ func (job *JobObject) PromoteToSilo() error {
 // isSilo returns if the job object is a silo.
 func (job *JobObject) isSilo() bool {
 	return atomic.LoadUint32(&job.isAppSilo) == 1
+}
+
+// QueryPrivateWorkingSet returns the private working set size for the job. This is calculated by adding up the
+// private working set for every process running in the job.
+func (job *JobObject) QueryPrivateWorkingSet() (uint64, error) {
+	pids, err := job.Pids()
+	if err != nil {
+		return 0, err
+	}
+
+	openAndQueryWorkingSet := func(pid uint32) (uint64, error) {
+		h, err := windows.OpenProcess(windows.PROCESS_QUERY_LIMITED_INFORMATION, false, pid)
+		if err != nil {
+			// Continue to the next if OpenProcess doesn't return a valid handle (fails). Handles a
+			// case where one of the pids in the job exited before we open.
+			return 0, nil
+		}
+		defer func() {
+			_ = windows.Close(h)
+		}()
+		// Check if the process is actually running in the job still. There's a small chance
+		// that the process could have exited and had its pid re-used between grabbing the pids
+		// in the job and opening the handle to it above.
+		var inJob int32
+		if err := winapi.IsProcessInJob(h, job.handle, &inJob); err != nil {
+			// This shouldn't fail unless we have incorrect access rights which we control
+			// here so probably best to error out if this failed.
+			return 0, err
+		}
+		// Don't report stats for this process as it's not running in the job. This shouldn't be
+		// an error condition though.
+		if inJob == 0 {
+			return 0, nil
+		}
+
+		var vmCounters winapi.VM_COUNTERS_EX2
+		status := winapi.NtQueryInformationProcess(
+			h,
+			winapi.ProcessVmCounters,
+			uintptr(unsafe.Pointer(&vmCounters)),
+			uint32(unsafe.Sizeof(vmCounters)),
+			nil,
+		)
+		if !winapi.NTSuccess(status) {
+			return 0, fmt.Errorf("failed to query information for process: %w", winapi.RtlNtStatusToDosError(status))
+		}
+		return uint64(vmCounters.PrivateWorkingSetSize), nil
+	}
+
+	var jobWorkingSetSize uint64
+	for _, pid := range pids {
+		workingSet, err := openAndQueryWorkingSet(pid)
+		if err != nil {
+			return 0, err
+		}
+		jobWorkingSetSize += workingSet
+	}
+
+	return jobWorkingSetSize, nil
 }
